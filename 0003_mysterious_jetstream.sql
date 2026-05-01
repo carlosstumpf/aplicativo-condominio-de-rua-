@@ -1,0 +1,1 @@
+-- Columns already exist in database, skipping migration
