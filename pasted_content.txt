@@ -1,0 +1,724 @@
+/**
+ * ============================================================
+ * GESTÃO DA RUA — BOT WHATSAPP v2.1
+ * Stack: Baileys + Supabase + Asaas + Express + Render
+ * ============================================================
+ */
+
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
+const { Pool } = require('pg');
+const axios = require('axios');
+const express = require('express');
+const pino = require('pino');
+
+// ============================================================
+// 1. CONFIGURAÇÕES
+// ============================================================
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+const ASAAS_API_KEY = process.env.ASAAS_API_KEY;
+const ASAAS_URL = process.env.ASAAS_ENV === 'production'
+    ? 'https://api.asaas.com/v3'
+    : 'https://sandbox.asaas.com/api/v3';
+
+const ADMINISTRADORES = (process.env.ADMINS || '')
+    .split(',')
+    .map(n => `${n.trim()}@s.whatsapp.net`)
+    .filter(Boolean);
+
+const VALOR_MENSALIDADE = parseFloat(process.env.VALOR_MENSALIDADE || '50.00');
+const NOME_ASSOCIACAO   = process.env.NOME_ASSOCIACAO || 'Associação de Moradores';
+
+let sockGlobal  = null;
+let qrCodeAtual = '';
+
+// Sessões de conversa em memória: { jid -> { passo, dados } }
+const sessoes = new Map();
+
+// ============================================================
+// 2. BANCO DE DADOS
+// ============================================================
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+});
+
+async function testarBanco() {
+    try {
+        await pool.query('SELECT NOW()');
+        console.log('🐘 Supabase conectado!');
+    } catch (err) {
+        console.error('❌ Falha na conexão com Supabase:', err.message);
+        process.exit(1);
+    }
+}
+
+// ============================================================
+// 3. UTILITÁRIOS
+// ============================================================
+const fone = jid => jid.split('@')[0];
+
+const moeda = v =>
+    new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+
+const dataVencimento = (dias = 1) => {
+    const d = new Date();
+    d.setDate(d.getDate() + dias);
+    return d.toISOString().split('T')[0];
+};
+
+const mesReferencia = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+};
+
+const inicioMesAtual = () => {
+    const d = new Date();
+    return new Date(d.getFullYear(), d.getMonth(), 1).toISOString();
+};
+
+async function enviar(jid, texto) {
+    if (!sockGlobal) return;
+    try {
+        await sockGlobal.sendMessage(jid, { text: texto });
+    } catch (err) {
+        console.error(`Erro ao enviar para ${jid}:`, err.message);
+    }
+}
+
+async function notificarAdmins(msg) {
+    for (const admin of ADMINISTRADORES) await enviar(admin, msg);
+}
+
+// ============================================================
+// 4. ASAAS
+// ============================================================
+const asaasHead = () => ({ 'access_token': ASAAS_API_KEY });
+
+async function obterOuCriarClienteAsaas(telefone, nome, cpf) {
+    // Busca por referência externa antes de criar
+    const busca = await axios.get(`${ASAAS_URL}/customers`, {
+        params: { externalReference: telefone },
+        headers: asaasHead()
+    });
+    if (busca.data.data?.length > 0) return busca.data.data[0].id;
+
+    const criacao = await axios.post(`${ASAAS_URL}/customers`, {
+        name: nome || `Morador ${telefone}`,
+        cpfCnpj: cpf,
+        mobilePhone: telefone,
+        externalReference: telefone,
+        notificationDisabled: false
+    }, { headers: asaasHead() });
+
+    return criacao.data.id;
+}
+
+async function gerarCobranca(telefone, tipo) {
+    // 1. Busca morador pelo telefone (coluna correta: telefone)
+    const { rows: moradores } = await pool.query(
+        `SELECT id, nome_completo, cpf, identificacao_casa, asaas_customer_id
+         FROM moradores
+         WHERE telefone = $1 AND status_ativo = true`,
+        [telefone]
+    );
+
+    if (moradores.length === 0) {
+        return {
+            sucesso: false,
+            mensagem: '❌ Seu número não está cadastrado.\n\nDigite *CADASTRAR* para se registrar.'
+        };
+    }
+
+    const m = moradores[0];
+    const mes = mesReferencia();
+
+    // 2. Verifica cobrança pendente do mesmo mês/tipo
+    const { rows: pendentes } = await pool.query(
+        `SELECT id FROM cobrancas
+         WHERE telefone = $1 AND tipo = $2 AND mes_referencia = $3
+         AND status IN ('PENDING','RECEIVED')`,
+        [telefone, tipo, mes]
+    );
+    if (pendentes.length > 0) {
+        return {
+            sucesso: false,
+            mensagem: `⚠️ Você já possui uma cobrança ${tipo} para ${mes}.\nDigite *MENU* para ver outras opções.`
+        };
+    }
+
+    // 3. Obtém ou cria cliente Asaas
+    let customerId = m.asaas_customer_id;
+    if (!customerId) {
+        customerId = await obterOuCriarClienteAsaas(telefone, m.nome_completo, m.cpf);
+        await pool.query(
+            'UPDATE moradores SET asaas_customer_id = $1 WHERE id = $2',
+            [customerId, m.id]
+        );
+    }
+
+    // 4. Cria cobrança no Asaas
+    const venc = dataVencimento(tipo === 'BOLETO' ? 5 : 1);
+    const descricao = `Mensalidade ${NOME_ASSOCIACAO} - ${mes}`;
+
+    const cobResp = await axios.post(`${ASAAS_URL}/payments`, {
+        customer: customerId,
+        billingType: tipo,
+        value: VALOR_MENSALIDADE,
+        dueDate: venc,
+        description: descricao,
+        externalReference: telefone
+    }, { headers: asaasHead() });
+
+    const cobrancaId = cobResp.data.id;
+
+    // 5. Salva no banco (com morador_id e mes_referencia)
+    await pool.query(
+        `INSERT INTO cobrancas
+            (morador_id, telefone, asaas_payment_id, tipo, mes_referencia, valor, vencimento, status, descricao)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', $8)`,
+        [m.id, telefone, cobrancaId, tipo, mes, VALOR_MENSALIDADE, venc, descricao]
+    );
+
+    // 6. Retorna dados específicos por tipo
+    if (tipo === 'PIX') {
+        const pixResp = await axios.get(
+            `${ASAAS_URL}/payments/${cobrancaId}/pixQrCode`,
+            { headers: asaasHead() }
+        );
+        return { sucesso: true, tipo: 'PIX', payload: pixResp.data.payload, valor: VALOR_MENSALIDADE, vencimento: venc };
+    } else {
+        const boletoResp = await axios.get(
+            `${ASAAS_URL}/payments/${cobrancaId}/identificationField`,
+            { headers: asaasHead() }
+        );
+        return {
+            sucesso: true,
+            tipo: 'BOLETO',
+            linhaDigitavel: boletoResp.data.identificationField,
+            linkBoleto: cobResp.data.bankSlipUrl || `https://www.asaas.com/b/pdf/${cobrancaId}`,
+            valor: VALOR_MENSALIDADE,
+            vencimento: venc
+        };
+    }
+}
+
+// ============================================================
+// 5. MENU DOS MORADORES
+// ============================================================
+async function processarMorador(remetente, texto) {
+    const cmd = texto.trim().toLowerCase();
+    const sessao = sessoes.get(remetente) || { passo: null, dados: {} };
+
+    // ── FLUXO DE CADASTRO ──
+    if (sessao.passo === 'aguardando_nome') {
+        sessao.dados.nome = texto.trim();
+        sessao.passo = 'aguardando_cpf';
+        sessoes.set(remetente, sessao);
+        await enviar(remetente, '📝 Agora me informe seu *CPF* (somente números):');
+        return;
+    }
+
+    if (sessao.passo === 'aguardando_cpf') {
+        const cpf = texto.replace(/\D/g, '');
+        if (cpf.length !== 11) {
+            await enviar(remetente, '❌ CPF inválido. Digite os *11 dígitos*, somente números:');
+            return;
+        }
+        sessao.dados.cpf = cpf;
+        sessao.passo = 'aguardando_casa';
+        sessoes.set(remetente, sessao);
+        await enviar(remetente, '🏠 Qual é o *número da sua casa/lote?*');
+        return;
+    }
+
+    if (sessao.passo === 'aguardando_casa') {
+        sessao.dados.casa = texto.trim();
+        sessoes.delete(remetente);
+        const tel = fone(remetente);
+
+        try {
+            // Usa os nomes de coluna corretos: nome_completo, cpf, identificacao_casa
+            await pool.query(
+                `INSERT INTO moradores (telefone, nome_completo, cpf, identificacao_casa)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (telefone)
+                 DO UPDATE SET nome_completo=$2, cpf=$3, identificacao_casa=$4`,
+                [tel, sessao.dados.nome, sessao.dados.cpf, sessao.dados.casa]
+            );
+            await notificarAdmins(
+                `📋 *Novo morador cadastrado!*\nNome: ${sessao.dados.nome}\nCasa: ${sessao.dados.casa}\nTel: ${tel}`
+            );
+            await enviar(remetente,
+                `✅ *Cadastro realizado!*\n\nBem-vindo(a), ${sessao.dados.nome}! 🎉\n\nDigite *MENU* para ver as opções.`
+            );
+        } catch (err) {
+            console.error('Erro no cadastro:', err);
+            await enviar(remetente, '❌ Erro ao salvar cadastro. Contate a administração.');
+        }
+        return;
+    }
+
+    // ── FLUXO DE RELATO ──
+    if (sessao.passo === 'aguardando_problema') {
+        sessoes.delete(remetente);
+        await notificarAdmins(`⚠️ *PROBLEMA RELATADO*\nMorador: ${fone(remetente)}\nMensagem: ${texto}`);
+        await enviar(remetente, '✅ Relato enviado para a administração. Em breve entrarão em contato!');
+        return;
+    }
+
+    // ── MENU PRINCIPAL ──
+    if (['oi', 'olá', 'ola', 'menu', 'inicio', 'início', 'start'].includes(cmd)) {
+        await enviar(remetente,
+            `🏡 *${NOME_ASSOCIACAO}*\n` +
+            `━━━━━━━━━━━━━━━━━━━\n` +
+            `Olá! Como posso ajudar?\n\n` +
+            `*1* — 💰 Pagar via Pix\n` +
+            `*2* — 🧾 Pagar via Boleto\n` +
+            `*3* — 📊 Prestação de Contas\n` +
+            `*4* — 🔔 Relatar um problema\n` +
+            `*5* — 👤 Falar com a administração\n\n` +
+            `━━━━━━━━━━━━━━━━━━━\n` +
+            `_Digite CADASTRAR para se registrar._`
+        );
+        return;
+    }
+
+    if (cmd === 'cadastrar') {
+        sessoes.set(remetente, { passo: 'aguardando_nome', dados: {} });
+        await enviar(remetente, '📝 Vamos fazer seu cadastro!\n\nQual é o seu *nome completo?*');
+        return;
+    }
+
+    if (cmd === '1' || cmd === '2') {
+        const tipo = cmd === '1' ? 'PIX' : 'BOLETO';
+        await enviar(remetente, `⏳ Gerando seu ${tipo}, aguarde...`);
+        try {
+            const resultado = await gerarCobranca(fone(remetente), tipo);
+            if (!resultado.sucesso) { await enviar(remetente, resultado.mensagem); return; }
+
+            const dataFmt = new Date(resultado.vencimento + 'T12:00:00')
+                .toLocaleDateString('pt-BR');
+
+            if (tipo === 'PIX') {
+                await enviar(remetente,
+                    `✅ *Pix Gerado!*\n\n` +
+                    `*Valor:* ${moeda(resultado.valor)}\n` +
+                    `*Vencimento:* ${dataFmt}\n\n` +
+                    `📋 *Copia e Cola:*\n\n${resultado.payload}\n\n` +
+                    `_Confirmação automática após o pagamento._`
+                );
+            } else {
+                await enviar(remetente,
+                    `✅ *Boleto Gerado!*\n\n` +
+                    `*Valor:* ${moeda(resultado.valor)}\n` +
+                    `*Vencimento:* ${dataFmt}\n\n` +
+                    `📋 *Linha Digitável:*\n${resultado.linhaDigitavel}\n\n` +
+                    `🔗 *Link:* ${resultado.linkBoleto}\n\n` +
+                    `_Pague em qualquer banco ou lotérica._`
+                );
+            }
+       } catch (err) {
+            const erroDetalhe = JSON.stringify(err.response?.data || err.message);
+            console.error(`Erro ao gerar ${tipo}:`, erroDetalhe);
+            await enviar(remetente, `❌ Erro ao gerar ${tipo}.\n\nDetalhe: ${erroDetalhe}`);
+        }
+        return;
+    }
+
+    if (cmd === '3') {
+        try {
+            const inicio = inicioMesAtual();
+            const mes = mesReferencia();
+
+            const [rec, desp, inadim] = await Promise.all([
+                pool.query(
+                    `SELECT COALESCE(SUM(valor), 0) AS total
+                     FROM cobrancas WHERE status = 'RECEIVED' AND mes_referencia = $1`,
+                    [mes]
+                ),
+                pool.query(
+                    `SELECT COALESCE(SUM(valor), 0) AS total,
+                     json_agg(json_build_object('categoria', categoria, 'valor', valor)) AS itens
+                     FROM despesas WHERE criado_em >= $1`,
+                    [inicio]
+                ),
+                pool.query(
+                    `SELECT COUNT(*) AS total FROM moradores m
+                     WHERE status_ativo = true
+                     AND NOT EXISTS (
+                         SELECT 1 FROM cobrancas c
+                         WHERE c.morador_id = m.id
+                         AND c.status = 'RECEIVED'
+                         AND c.mes_referencia = $1
+                     )`,
+                    [mes]
+                )
+            ]);
+
+            const receitas     = parseFloat(rec.rows[0].total);
+            const despesaTotal = parseFloat(desp.rows[0].total);
+            const saldo        = receitas - despesaTotal;
+            const emAtraso     = parseInt(inadim.rows[0].total);
+
+            const itens = (desp.rows[0].itens || [])
+                .filter(Boolean)
+                .map(i => `  • ${i.categoria}: ${moeda(i.valor)}`)
+                .join('\n') || '  Nenhuma despesa registrada';
+
+            const periodo = new Date().toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+
+            await enviar(remetente,
+                `📊 *Prestação de Contas — ${periodo}*\n` +
+                `━━━━━━━━━━━━━━━━━━━\n\n` +
+                `💚 *Receitas:* ${moeda(receitas)}\n` +
+                `🔴 *Despesas:* ${moeda(despesaTotal)}\n` +
+                `${saldo >= 0 ? '🟢' : '🔴'} *Saldo:* ${moeda(saldo)}\n\n` +
+                `📋 *Detalhamento:*\n${itens}\n\n` +
+                `⚠️ *Em atraso:* ${emAtraso} morador(es)\n` +
+                `━━━━━━━━━━━━━━━━━━━`
+            );
+        } catch (err) {
+            console.error('Erro na prestação de contas:', err);
+            await enviar(remetente, '❌ Erro ao gerar relatório. Tente novamente.');
+        }
+        return;
+    }
+
+    if (cmd === '4') {
+        sessoes.set(remetente, { passo: 'aguardando_problema', dados: {} });
+        await enviar(remetente, '🔔 Descreva o problema que deseja relatar:');
+        return;
+    }
+
+    if (cmd === '5') {
+        await notificarAdmins(`📞 *CHAMADO* — Morador ${fone(remetente)} solicitou atendimento.`);
+        await enviar(remetente, '✅ A administração foi notificada e entrará em contato em breve!');
+        return;
+    }
+
+    await enviar(remetente, `Não entendi. Digite *MENU* para ver as opções. 😊`);
+}
+
+// ============================================================
+// 6. COMANDOS ADMIN
+// ============================================================
+async function processarAdmin(remetente, texto) {
+    const args    = texto.trim().split(/\s+/);
+    const comando = args[0].toLowerCase();
+
+    if (comando === '/despesa') {
+        if (args.length < 3) {
+            await enviar(remetente,
+                `⚠️ Formato: /despesa <valor> <categoria> <descrição>\n\n` +
+                `Ex: /despesa 150.00 Limpeza Compra de vassouras`
+            );
+            return;
+        }
+        const valor = parseFloat(args[1].replace(',', '.'));
+        if (isNaN(valor) || valor <= 0) {
+            await enviar(remetente, '⚠️ Valor inválido. Use números (ex: 150.00).');
+            return;
+        }
+        const categoria = args[2];
+        const descricao = args.slice(3).join(' ') || categoria;
+
+        try {
+            await pool.query(
+                `INSERT INTO despesas (administrador_telefone, valor, categoria, descricao)
+                 VALUES ($1, $2, $3, $4)`,
+                [fone(remetente), valor, categoria, descricao]
+            );
+            await enviar(remetente,
+                `✅ *Despesa Registrada!*\n\n` +
+                `*Valor:* ${moeda(valor)}\n*Categoria:* ${categoria}\n*Descrição:* ${descricao}`
+            );
+        } catch (err) {
+            console.error('Erro ao registrar despesa:', err);
+            await enviar(remetente, '❌ Erro ao salvar despesa.');
+        }
+        return;
+    }
+
+    if (comando === '/inadimplentes') {
+        try {
+            const mes = mesReferencia();
+            const { rows } = await pool.query(
+                `SELECT m.nome_completo, m.telefone, m.identificacao_casa
+                 FROM moradores m
+                 WHERE m.status_ativo = true
+                 AND NOT EXISTS (
+                     SELECT 1 FROM cobrancas c
+                     WHERE c.morador_id = m.id
+                     AND c.status = 'RECEIVED'
+                     AND c.mes_referencia = $1
+                 )
+                 ORDER BY m.identificacao_casa`,
+                [mes]
+            );
+
+            if (rows.length === 0) {
+                await enviar(remetente, '✅ Todos em dia este mês!');
+                return;
+            }
+
+            const lista = rows
+                .map(r => `• ${r.nome_completo || 'Sem nome'} — Casa ${r.identificacao_casa || '?'} — ${r.telefone}`)
+                .join('\n');
+
+            await enviar(remetente, `⚠️ *Inadimplentes (${rows.length}):*\n\n${lista}`);
+        } catch (err) {
+            console.error('Erro em /inadimplentes:', err);
+            await enviar(remetente, '❌ Erro ao buscar inadimplentes.');
+        }
+        return;
+    }
+
+    if (comando === '/cobrar') {
+        try {
+            const mes = mesReferencia();
+            const { rows } = await pool.query(
+                `SELECT m.nome_completo, m.telefone FROM moradores m
+                 WHERE m.status_ativo = true
+                 AND NOT EXISTS (
+                     SELECT 1 FROM cobrancas c
+                     WHERE c.morador_id = m.id
+                     AND c.status = 'RECEIVED'
+                     AND c.mes_referencia = $1
+                 )`,
+                [mes]
+            );
+
+            if (rows.length === 0) {
+                await enviar(remetente, '✅ Nenhum inadimplente para cobrar!');
+                return;
+            }
+
+            let enviados = 0;
+            for (const m of rows) {
+                await enviar(`${m.telefone}@s.whatsapp.net`,
+                    `🔔 *Lembrete de Mensalidade — ${NOME_ASSOCIACAO}*\n\n` +
+                    `Olá${m.nome_completo ? ', ' + m.nome_completo.split(' ')[0] : ''}! ` +
+                    `Sua mensalidade de *${moeda(VALOR_MENSALIDADE)}* ainda não foi identificada.\n\n` +
+                    `Digite *1* para gerar Pix ou *2* para Boleto. 🏡`
+                );
+                enviados++;
+                await new Promise(r => setTimeout(r, 1500));
+            }
+
+            await enviar(remetente, `✅ Lembrete enviado para *${enviados}* moradores.`);
+        } catch (err) {
+            console.error('Erro em /cobrar:', err);
+            await enviar(remetente, '❌ Erro ao processar cobranças em massa.');
+        }
+        return;
+    }
+
+    if (comando === '/resumo') {
+        try {
+            const mes   = mesReferencia();
+            const inicio = inicioMesAtual();
+
+            const [rec, desp, total] = await Promise.all([
+                pool.query(`SELECT COALESCE(SUM(valor),0) AS v FROM cobrancas WHERE status='RECEIVED' AND mes_referencia=$1`, [mes]),
+                pool.query(`SELECT COALESCE(SUM(valor),0) AS v FROM despesas WHERE criado_em >= $1`, [inicio]),
+                pool.query(`SELECT COUNT(*) AS v FROM moradores WHERE status_ativo=true`)
+            ]);
+
+            const receitas  = parseFloat(rec.rows[0].v);
+            const despesas  = parseFloat(desp.rows[0].v);
+            const moradores = parseInt(total.rows[0].v);
+
+            await enviar(remetente,
+                `📊 *Resumo — ${mes}*\n\n` +
+                `💰 Receitas:  ${moeda(receitas)}\n` +
+                `💸 Despesas:  ${moeda(despesas)}\n` +
+                `💼 Saldo:     ${moeda(receitas - despesas)}\n` +
+                `👥 Moradores: ${moradores}\n\n` +
+                `Comandos: /inadimplentes /cobrar /despesa /resumo`
+            );
+        } catch (err) {
+            await enviar(remetente, '❌ Erro ao gerar resumo.');
+        }
+        return;
+    }
+
+    await enviar(remetente,
+        `❓ Comando desconhecido.\n\n` +
+        `*Disponíveis:*\n/despesa <valor> <cat> <desc>\n/inadimplentes\n/cobrar\n/resumo`
+    );
+}
+
+// ============================================================
+// 7. SERVIDOR WEB + WEBHOOK ASAAS
+// ============================================================
+app.use(express.json());
+
+app.get('/', (req, res) => {
+    if (qrCodeAtual) {
+        res.send(`
+            <html><head><title>Conectar WhatsApp</title>
+            <meta http-equiv="refresh" content="30"></head>
+            <body style="text-align:center;font-family:Arial;background:#f0f2f5;padding:50px">
+                <h2>📱 Conecte o WhatsApp da Associação</h2>
+                <p style="color:#888">Atualiza automaticamente a cada 30s</p>
+                <div style="background:white;padding:20px;display:inline-block;border-radius:10px">
+                    <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrCodeAtual)}" />
+                </div>
+            </body></html>`
+        );
+    } else {
+        res.send('<h2 style="font-family:Arial;text-align:center;margin-top:50px;color:green">✅ Sistema operante e conectado!</h2>');
+    }
+});
+
+// Webhook de pagamentos Asaas
+app.post('/webhook-asaas', async (req, res) => {
+    const token = req.headers['asaas-access-token'];
+    if (process.env.WEBHOOK_TOKEN && token !== process.env.WEBHOOK_TOKEN) {
+        console.log('⚠️ Webhook rejeitado: token inválido');
+        return res.sendStatus(401);
+    }
+    res.sendStatus(200);
+
+    const { event, payment } = req.body;
+    if (!payment) return;
+    console.log(`📩 Webhook: ${event} — ${payment.id}`);
+
+    try {
+        if (event === 'PAYMENT_RECEIVED' || event === 'PAYMENT_CONFIRMED') {
+            const { rows } = await pool.query(
+                `UPDATE cobrancas SET status='RECEIVED', atualizado_em=NOW()
+                 WHERE asaas_payment_id=$1 RETURNING telefone, valor`,
+                [payment.id]
+            );
+            if (rows.length > 0) {
+                const { telefone, valor } = rows[0];
+                await enviar(`${telefone}@s.whatsapp.net`,
+                    `✅ *Pagamento Confirmado!*\n\n` +
+                    `Recebemos ${moeda(valor)}. Obrigado pela contribuição! 🙏🏡`
+                );
+                await notificarAdmins(`💚 Pagamento: ${moeda(valor)} — ${telefone}`);
+            }
+        }
+
+        if (event === 'PAYMENT_OVERDUE') {
+            const { rows } = await pool.query(
+                `UPDATE cobrancas SET status='OVERDUE', atualizado_em=NOW()
+                 WHERE asaas_payment_id=$1 RETURNING telefone, valor`,
+                [payment.id]
+            );
+            if (rows.length > 0) {
+                const { telefone, valor } = rows[0];
+                await enviar(`${telefone}@s.whatsapp.net`,
+                    `⚠️ *Mensalidade Vencida!*\n\n` +
+                    `Sua mensalidade de ${moeda(valor)} venceu.\n` +
+                    `Digite *1* para gerar um novo Pix ou *2* para Boleto.`
+                );
+            }
+        }
+    } catch (err) {
+        console.error('Erro no webhook:', err);
+    }
+});
+
+// Keep-alive para o Render não hibernar
+if (process.env.KEEP_ALIVE_URL) {
+    setInterval(async () => {
+        try {
+            await axios.get(process.env.KEEP_ALIVE_URL);
+            console.log('💓 Keep-alive ping');
+        } catch (e) {}
+    }, 10 * 60 * 1000);
+}
+
+// ============================================================
+// 8. MOTOR WHATSAPP
+// ============================================================
+async function iniciarBot() {
+    const { state, saveCreds } = await useMultiFileAuthState('./auth_info_baileys');
+    const { version }          = await fetchLatestBaileysVersion();
+
+    const sock = makeWASocket({
+        version,
+        auth: state,
+        logger: pino({ level: 'silent' }),
+        browser: ['GestaoRua', 'Chrome', '3.0.0'],
+        generateHighQualityLinkPreview: false,
+        syncFullHistory: false,
+    });
+
+    sockGlobal = sock;
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+        if (qr) {
+            qrCodeAtual = qr;
+            console.log('⚠️ QR Code gerado — acesse a URL do Render para escanear.');
+        }
+        if (connection === 'close') {
+            qrCodeAtual = '';
+            const code = lastDisconnect?.error?.output?.statusCode;
+            if (code !== DisconnectReason.loggedOut) {
+                console.log('🔄 Reconectando em 5s...');
+                setTimeout(iniciarBot, 5000);
+            } else {
+                console.log('🚨 Sessão encerrada. Apague auth_info_baileys e reinicie.');
+            }
+        }
+        if (connection === 'open') {
+            qrCodeAtual = '';
+            console.log('✅ WhatsApp conectado!');
+        }
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify') return;
+        const msg = messages[0];
+        if (!msg.message || msg.key.fromMe) return;
+
+        const remetente = msg.key.remoteJid;
+        if (remetente.endsWith('@g.us')) return; // ignora grupos
+
+        const texto = (
+            msg.message.conversation ||
+            msg.message.extendedTextMessage?.text || ''
+        ).trim();
+        if (!texto) return;
+
+        console.log(`📨 [${fone(remetente)}]: ${texto.substring(0, 60)}`);
+
+        try {
+            if (ADMINISTRADORES.includes(remetente) && texto.startsWith('/')) {
+                await processarAdmin(remetente, texto);
+            } else {
+                await processarMorador(remetente, texto);
+            }
+        } catch (err) {
+            console.error('Erro ao processar mensagem:', err);
+            await enviar(remetente, '❌ Erro interno. Tente novamente.');
+        }
+    });
+}
+
+// ============================================================
+// 9. INICIALIZAÇÃO
+// ============================================================
+(async () => {
+    try {
+        await testarBanco();
+    } catch (err) {
+        console.error('⚠️ Banco falhou mas servidor continua:', err.message);
+        // Não faz process.exit(1) — deixa o servidor de pé
+    }
+    await iniciarBot();
+})();
